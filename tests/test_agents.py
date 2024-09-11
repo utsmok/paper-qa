@@ -3,13 +3,18 @@ from __future__ import annotations
 import itertools
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
+import ldp.agent
 import pytest
-from aviary.tools import ToolsAdapter, ToolSelector
+from aviary.tools import ToolRequestMessage, ToolsAdapter, ToolSelector
 from ldp.agent import SimpleAgent
+from ldp.graph.memory import Memory, UIndexMemoryModel
+from ldp.graph.ops import OpResult
+from ldp.llms import EmbeddingModel
 from pydantic import ValidationError
 from pytest_subtests import SubTests
 
@@ -22,11 +27,12 @@ from paperqa.agents.tools import (
     GatherEvidence,
     GenerateAnswer,
     PaperSearch,
+    make_status,
 )
 from paperqa.docs import Docs
 from paperqa.settings import AgentSettings, Settings
 from paperqa.types import Answer, Context, Doc, Text
-from paperqa.utils import get_year, md5sum
+from paperqa.utils import extract_thought, get_year, md5sum
 
 
 @pytest.mark.asyncio
@@ -101,6 +107,72 @@ async def test_agent_types(
             response.answer.token_counts[agent_llm][1] > 50
         ), "Expected many completion tokens"
         assert response.answer.cost > 0, "Expected nonzero cost"
+
+
+@pytest.mark.flaky(reruns=2, only_rerun=["AssertionError"])
+@pytest.mark.asyncio
+async def test_successful_memory_agent() -> None:
+    tic = time.perf_counter()
+    memory_id = "call_Wtmv95JbNcQ2nRQCZBoOfcJy"  # Stub value
+    memory = Memory(
+        query=(
+            "Use the tools to answer the question: How can you use XAI for chemical"
+            " property prediction?\n\nThe gen_answer tool output is visible to the"
+            " user, so you do not need to restate the answer and can simply"
+            " terminate if the answer looks sufficient. The current status of"
+            " evidence/papers/cost is "
+            f"{make_status(total_paper_count=0, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Started 0
+            "\n\nTool request message '' for tool calls: paper_search(query='XAI for"
+            " chemical property prediction', min_year='2018', max_year='2024')"
+            f" [id={memory_id}]\n\nTool response message '"
+            f"{make_status(total_paper_count=2, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Found 2
+            f"' for tool call ID {memory_id} of tool 'paper_search'"
+        ),
+        input=(
+            "Use the tools to answer the question: How can you use XAI for chemical"
+            " property prediction?\n\nThe gen_answer tool output is visible to the"
+            " user, so you do not need to restate the answer and can simply terminate"
+            " if the answer looks sufficient. The current status of"
+            " evidence/papers/cost is "
+            f"{make_status(total_paper_count=0, relevant_paper_count=0, evidence_count=0, cost=0.0)}"
+        ),
+        output=(
+            "Tool request message '' for tool calls: paper_search(query='XAI for"
+            " chemical property prediction', min_year='2018', max_year='2024')"
+            f" [id={memory_id}]"
+        ),
+        value=5.0,  # Stub value
+        template="Input: {input}\n\nOutput: {output}\n\nDiscounted Reward: {value}",
+    )
+    memory_model = UIndexMemoryModel(
+        embedding_model=EmbeddingModel.from_name("text-embedding-3-small")
+    )
+    await memory_model.add_memory(memory)
+    serialized_memory_model = memory_model.model_dump(exclude_none=True)
+    query = QueryRequest(query="How can you use XAI for chemical property prediction?")
+    # NOTE: use Claude 3 for its <thinking> feature, testing regex replacement of it
+    query.settings.agent.agent_llm = "claude-3-opus-20240229"
+    query.settings.agent.agent_config = {
+        "memories": serialized_memory_model.pop("memories"),
+        "memory_model": serialized_memory_model,
+    }
+
+    thoughts: list[str] = []
+
+    async def on_agent_action(action: OpResult[ToolRequestMessage], *_) -> None:
+        thoughts.append(extract_thought(content=action.value.content))
+
+    response = await agent_query(
+        query,
+        Docs(),
+        agent_type=f"{ldp.agent.__name__}.MemoryAgent",
+        on_agent_action_callback=on_agent_action,
+    )
+    assert response.status == AgentStatus.SUCCESS, "Agent did not succeed"
+    assert (
+        time.perf_counter() - tic <= query.settings.agent.timeout
+    ), "Agent should not have timed out"
+    assert all("<thinking>" not in thought for thought in thoughts)
 
 
 @pytest.mark.parametrize("agent_type", [ToolSelector, SimpleAgent])
