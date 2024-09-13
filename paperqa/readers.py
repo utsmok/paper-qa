@@ -3,8 +3,10 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 from typing import Literal, overload
+from itertools import zip_longest
 
 import pymupdf
+import pymupdf4llm
 import tiktoken
 from html2text import __version__ as html2text_version
 from html2text import html2text
@@ -14,65 +16,29 @@ from paperqa.utils import ImpossibleParsingError
 from paperqa.version import __version__ as pqa_version
 
 
-def parse_pdf_to_pages(path: Path) -> ParsedText:
-
-    with pymupdf.open(path) as file:
-        pages: dict[str, str] = {}
-        total_length = 0
-
-        for i in range(file.page_count):
-            page = file.load_page(i)
-            pages[str(i + 1)] = page.get_text("text", sort=True)
-            total_length += len(pages[str(i + 1)])
-
-    metadata = ParsedMetadata(
-        parsing_libraries=[f"pymupdf ({pymupdf.__version__})"],
-        paperqa_version=pqa_version,
-        total_parsed_text_length=total_length,
-        parse_type="pdf",
-    )
-    return ParsedText(content=pages, metadata=metadata)
+def parse_document(path: Path) -> ParsedText:
+    
+    return ParsedText(content=text, metadata=metadata)
 
 
-def chunk_pdf(
+def chunk_ParsedText(
     parsed_text: ParsedText, doc: Doc, chunk_chars: int, overlap: int
 ) -> list[Text]:
-    pages: list[str] = []
-    texts: list[Text] = []
-    split: str = ""
-
-    if not isinstance(parsed_text.content, dict):
-        raise NotImplementedError(
-            f"ParsedText.content must be a `dict`, not {type(parsed_text.content)}."
-        )
+    
+    text_content = parsed_text.content
 
     if not parsed_text.content:
         raise ImpossibleParsingError(
             "No text was parsed from the document: either empty or corrupted."
         )
+    
+    if len(text_content) > chunk_chars:
+        text_chunks = [text_content[i:i+chunk_chars] for i in range(0, len(text_content), chunk_chars)]
+    else:
+        text_content = [text_content]
 
-    for page_num, page_text in parsed_text.content.items():
-        split += page_text
-        pages.append(page_num)
-        # split could be so long it needs to be split
-        # into multiple chunks. Or it could be so short
-        # that it needs to be combined with the next chunk.
-        while len(split) > chunk_chars:
-            # pretty formatting of pages (e.g. 1-3, 4, 5-7)
-            pg = "-".join([pages[0], pages[-1]])
-            texts.append(
-                Text(
-                    text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc
-                )
-            )
-            split = split[chunk_chars - overlap :]
-            pages = [page_num]
-
-    if len(split) > overlap or not texts:
-        pg = "-".join([pages[0], pages[-1]])
-        texts.append(
-            Text(text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc)
-        )
+    texts = [Text(text=chunk, name=f"{doc.docname} chunk {i+1}") for i, chunk in enumerate(text_content)]
+  
     return texts
 
 
@@ -260,48 +226,22 @@ def read_doc(
         parsed_text_only: return parsed text without chunking
         include_metadata: return a tuple
     """
-    str_path = str(path)
-    parsed_text = None
-
-    # start with parsing -- users may want to store this separately
-    if str_path.endswith(".pdf"):
-        parsed_text = parse_pdf_to_pages(path)
-
-    elif str_path.endswith(".txt"):
-        parsed_text = parse_text(path)
-    elif str_path.endswith(".html"):
-        parsed_text = parse_text(path, html=True)
-    else:
-        parsed_text = parse_text(path, split_lines=True, use_tiktoken=False)
+    try:
+        parsed_text = ParsedText(path, chunk_chars, overlap, parsed_text_only)
+    except ImpossibleParsingError as e:
+        # this file type cannot be parsed by parsed_text, handle gracefully
+        ...
+    except ValueError as e:
+        # probably error in overlap vs chunk_chars, handle gracefully
+        ...
+    except Exception as e:
+        # other error?
+        ...
 
     if parsed_text_only:
-        return parsed_text
-
-    # next chunk the parsed text
-    if str_path.endswith(".pdf"):
-        chunked_text = chunk_pdf(
-            parsed_text, doc, chunk_chars=chunk_chars, overlap=overlap
-        )
-        chunk_metadata = ChunkMetadata(
-            chunk_chars=chunk_chars, overlap=overlap, chunk_type="overlap_pdf_by_page"
-        )
-    elif str_path.endswith((".txt", ".html")):
-        chunked_text = chunk_text(
-            parsed_text, doc, chunk_chars=chunk_chars, overlap=overlap
-        )
-        chunk_metadata = ChunkMetadata(
-            chunk_chars=chunk_chars, overlap=overlap, chunk_type="overlap"
-        )
-    else:
-        chunked_text = chunk_code_text(
-            parsed_text, doc, chunk_chars=chunk_chars, overlap=overlap
-        )
-        chunk_metadata = ChunkMetadata(
-            chunk_chars=chunk_chars, overlap=overlap, chunk_type="overlap_code_by_line"
-        )
+        return parsed_text.text
 
     if include_metadata:
-        parsed_text.metadata.chunk_metadata = chunk_metadata
-        return chunked_text, parsed_text.metadata
+        return parsed_text.chunked, parsed_text.metadata
 
-    return chunked_text
+    return parsed_text.chunked

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
+import pathlib
 
 import litellm  # for cost
 import tiktoken
@@ -250,13 +251,102 @@ class ParsedMetadata(BaseModel):
     paperqa_version: str = pqa_version
     parse_type: str | None = None
     chunk_metadata: ChunkMetadata | None = None
+    docname: str | None = None
 
 
 class ParsedText(BaseModel):
-    """Parsed text (pre-chunking)."""
+    """Parses text from a file, then chunks and encodes it.
+        Determines the parsing & chunking strategy from the filetype.
+        Parameters:
+        path: pathlib.Path() pointing to the document.
+        chunk_chars: int 
+            the amount of chars per chunk
+        overlap: int
+            the amount of chars that should overlap between chunks
+        skip_chunking: bool, default False
+            if true, it will not chunk on init. Call ParsedText.chunk(chunk_chars, overlap) later if needed.
+    """
 
-    content: dict | str | list[str]
+    text: str
     metadata: ParsedMetadata
+    MUPDF_SUPPORTED_FILETYPES = [".pdf", ".xps", ".epub", ".mobi", ".fb2", ".cbz", ".txt", ".svg"]
+    HTML_FILES = [".html", ".htm"]
+
+
+    def __init__(path: pathlib.Path, chunk_chars: int, overlap: int, skip_chunking: bool = False):
+        
+        self.path = path
+        self.filetype = self.path.suffix.lower()
+        
+        if self.filetype in MUPDF_SUPPORTED_FILETYPES or self.filetype in HTML_FILES:
+            self.split_lines=False
+        else:
+            # let's try a plain text approach, split per line -- probably code
+            self.split_lines=True
+
+        self.text, self.metadata = self.parse_doc()
+
+        if not skip_chunking:
+            self.chunked, self.chunk_metadata = self.chunk(chunk_chars, overlap)
+        else:
+            self.chunked, self.chunk_metadata = None, None
+        
+    def parse_doc() -> tuple[str, ParsedMetadata]:
+        """
+        Part of the init of the class: parses the text and creates the metadata.
+        todo: handle html
+        """
+        try:    
+            if self.split_lines:
+                doc: pymupdf.Document = pymupdf.open(path, "txt")        
+                with self.path.open(encoding="utf-8", errors="ignore") as f:
+                    text = list(f)
+                text_len = sum(map(len, text))
+            else:
+                doc: pymupdf.Document = pymupdf.open(path)
+                text: str = pymupdf4llm.to_markdown(doc)
+                text_len = len(text)
+        except RuntimeError as e:
+            # catches EmptyFileError, FileNotFoundError, or EmptyfileError
+            # handle gracefully
+            raise RuntimeError(f"There was an error opening or parsing the file {path.absolute()}: {e}")
+            # also catch other errors?
+
+        metadata = ParsedMetadata(
+            parsing_libraries=[f"pymupdf4llm ({pymupdf4llm.__version__})"],
+            paperqa_version=pqa_version,
+            total_parsed_text_length=text_len,
+            parse_type=self.filetype,
+            docname=doc.name,
+        )
+        return text, metadata
+
+    def chunk(self, chunk_chars: int, overlap: int) -> tuple[list[Text], ChunkMetadata]:
+        
+        # implement chunking of code by line
+
+        if overlap >= chunk_chars:
+            raise ValueError("overlap must be less than chunk_chars")
+
+        if not self.text:
+            return [Text(text="", name=f"{self.metadata.docname} has no content")]
+        if len(self.text) <= chunk_chars:
+            return [Text(text=self.content, name=f"{self.metadata.docname} chunk 1")]
+
+        chunks = []
+        start = 0
+                
+        while start < len(self.text):
+            end = min(start + chunk_len, len(self.text))
+            chunks.append(self.text[start:end])
+            start += max(1, chunk_len - overlap)
+
+        texts = [Text(text=chunk, name=f"{self.metadata.docname} chunk {i+1}") for i, chunk in enumerate(chunks)]
+        overlap_type = "overlap" if self.filetype not in CODE_FILES else "overlap by line"
+        chunk_metadata = ChunkMetadata(
+            chunk_chars=chunk_chars, overlap=overlap, chunk_type=overlap_type
+        )
+        return texts, chunk_metadata
 
     def encode_content(self):
         # we tokenize using tiktoken so cuts are in reasonable places
@@ -270,8 +360,7 @@ class ParsedText(BaseModel):
             raise NotImplementedError(
                 "Encoding only implemented for str and list[str] content."
             )
-
-
+    
 # We use these integer values
 # as defined in https://jfp.csc.fi/en/web/haku/kayttoohje
 # which is a recommended ranking system
